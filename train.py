@@ -6,11 +6,16 @@ import numpy as np
 from model import LSTM_Filter
 import os
 
-# Hyperparameters
+# --- Hyperparameters Adjusted for Convergence ---
 HIDDEN_SIZE = 128
-LEARNING_RATE = 0.001 # Standard LR
-EPOCHS = 15           # Reduced epochs because TBPTT is more efficient
-TBPTT_STEPS = 50      # Backpropagate every 50 steps (Virtual Sequence Length)
+# Increased LR to help escape the local minimum of predicting "0"
+LEARNING_RATE = 0.005 
+# Increased TBPTT steps to 500.
+# At 1000Hz sampling, 500 steps = 0.5 seconds.
+# This allows the network to see half a cycle of the 1Hz wave,
+# which is enough to learn the curvature/oscillation dynamics.
+TBPTT_STEPS = 500     
+EPOCHS = 100 
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 def load_data(filepath):
@@ -33,56 +38,48 @@ def train():
     
     for epoch in range(EPOCHS):
         model.train()
-        train_loss_accum = 0.0
         epoch_loss = 0.0
         
-        # Initialize Hidden State (h, c)
+        # Initialize Hidden State
         (h, c) = model.init_hidden(batch_size=1, device=DEVICE)
         
-        # Optimizer zero grad at start
         optimizer.zero_grad()
-        loss_buffer = 0 # To accumulate loss for TBPTT
+        loss_buffer = 0 
         
+        # Iterate through the continuous sequence
         for t in range(len(X_train)):
-            # 1. Prepare Input (L=1)
+            # Input L=1
             input_t = X_train[t].unsqueeze(0).to(DEVICE)
             target_t = y_train[t].unsqueeze(0).unsqueeze(0).to(DEVICE)
             
-            # 2. Forward Pass (Keep graph connected!)
+            # Forward pass (maintaining connection to past)
             output, (h, c) = model(input_t, (h, c))
             
-            # 3. Compute Loss
             loss = criterion(output, target_t)
             loss_buffer += loss
             epoch_loss += loss.item()
             
-            # 4. Truncated BPTT Logic
-            # We only backward and step every TBPTT_STEPS
+            # Truncated Backprop: Update weights every TBPTT_STEPS
             if (t + 1) % TBPTT_STEPS == 0:
                 loss_buffer.backward()
-                
-                # CRITICAL: Gradient Clipping to prevent explosion [cite: 1716]
-                # This fixes the spikes you saw (loss > 2.0)
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-                
                 optimizer.step()
                 optimizer.zero_grad()
                 
-                # Detach state here (keep values, cut graph)
+                # Detach state to cut graph, but keep values for next segment
                 h = h.detach()
                 c = c.detach()
-                
                 loss_buffer = 0
 
-            # Reset state at frequency block boundaries (optional but cleaner)
+            # Reset state at frequency block boundaries (10k, 20k, 30k)
             if (t + 1) % 10000 == 0:
                 (h, c) = model.init_hidden(batch_size=1, device=DEVICE)
-                loss_buffer = 0 # discard remaining gradients at boundary
+                loss_buffer = 0
                 optimizer.zero_grad()
             
         avg_train_loss = epoch_loss / len(X_train)
         
-        # --- Validation Loop ---
+        # --- Validation ---
         model.eval()
         test_loss = 0.0
         (h_val, c_val) = model.init_hidden(batch_size=1, device=DEVICE)
@@ -93,21 +90,22 @@ def train():
                 target_t = y_test[t].unsqueeze(0).unsqueeze(0).to(DEVICE)
                 
                 output, (h_val, c_val) = model(input_t, (h_val, c_val))
-                loss = criterion(output, target_t)
-                test_loss += loss.item()
+                test_loss += criterion(output, target_t).item()
                 
                 if (t + 1) % 10000 == 0:
                     (h_val, c_val) = model.init_hidden(batch_size=1, device=DEVICE)
 
         avg_test_loss = test_loss / len(X_test)
         
-        print(f"Epoch [{epoch+1}/{EPOCHS}] | Train MSE: {avg_train_loss:.6f} | Test MSE: {avg_test_loss:.6f}")
+        print(f"Epoch [{epoch+1}/{EPOCHS}] | Train MSE: {avg_train_loss:.5f} | Test MSE: {avg_test_loss:.5f}")
         
         # Save Best Model
         if avg_test_loss < best_test_loss:
             best_test_loss = avg_test_loss
             torch.save(model.state_dict(), 'best_lstm_model.pth')
-            print("  -> Best Model Saved!")
+            # print("  -> Best Model Saved!") # Optional: reduce clutter
+
+    print(f"Training Complete. Best Test MSE: {best_test_loss:.5f}")
 
 if __name__ == "__main__":
     train()
