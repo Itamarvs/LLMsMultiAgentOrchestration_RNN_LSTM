@@ -6,24 +6,42 @@ import numpy as np
 from model import LSTM_Filter
 import os
 
-# --- Tuning for "Escape Velocity" ---
+# --- Robust Hyperparameters ---
 HIDDEN_SIZE = 128
-LEARNING_RATE = 0.01  # Increased LR to force oscillation learning
-TBPTT_STEPS = 200     # Reduced slightly to allow more frequent updates
-EPOCHS = 20           # Should converge faster with high LR
+LEARNING_RATE = 0.005 
+TBPTT_STEPS = 200     
+EPOCHS = 50           
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-def load_data(filepath):
+def load_data_batched(filepath):
+    """
+    Loads data and reshapes it into (Seq_Len, Batch_Size, Features).
+    We split the 40,000 rows into 4 parallel streams of 10,000 (one per freq).
+    """
     df = pd.read_csv(filepath)
     X = df[['S_t', 'C1', 'C2', 'C3', 'C4']].values
     y = df['target'].values
-    return torch.tensor(X, dtype=torch.float32), torch.tensor(y, dtype=torch.float32)
+    
+    # Reshape: Total 40,000 -> 4 chunks of 10,000
+    # New Shape: (10000, 4, 5)
+    n_chunks = 4
+    chunk_size = len(X) // n_chunks
+    
+    X_batched = np.array([X[i*chunk_size : (i+1)*chunk_size] for i in range(n_chunks)])
+    y_batched = np.array([y[i*chunk_size : (i+1)*chunk_size] for i in range(n_chunks)])
+    
+    # Transpose to (Seq_Len, Batch, Feats) -> (10000, 4, ...)
+    X_batched = np.transpose(X_batched, (1, 0, 2))
+    y_batched = np.transpose(y_batched, (1, 0))
+    
+    return torch.tensor(X_batched, dtype=torch.float32), torch.tensor(y_batched, dtype=torch.float32)
 
 def train():
-    print(f"Training on {DEVICE} | LR={LEARNING_RATE} | Steps={TBPTT_STEPS}")
+    print(f"Training with Parallel Batching (Size=4) on {DEVICE}")
     
-    X_train, y_train = load_data('data/train_dataset.csv')
-    X_test, y_test = load_data('data/test_dataset.csv')
+    # Load Batched Data
+    X_train, y_train = load_data_batched('data/train_dataset.csv')
+    X_test, y_test = load_data_batched('data/test_dataset.csv')
     
     model = LSTM_Filter(input_size=5, hidden_size=HIDDEN_SIZE).to(DEVICE)
     criterion = nn.MSELoss()
@@ -35,13 +53,19 @@ def train():
         model.train()
         epoch_loss = 0.0
         
-        (h, c) = model.init_hidden(batch_size=1, device=DEVICE)
+        # Init Hidden State for Batch Size 4
+        (h, c) = model.init_hidden(batch_size=4, device=DEVICE)
+        
         optimizer.zero_grad()
         loss_buffer = 0 
         
-        for t in range(len(X_train)):
-            input_t = X_train[t].unsqueeze(0).to(DEVICE)
-            target_t = y_train[t].unsqueeze(0).unsqueeze(0).to(DEVICE)
+        # Iterate over the 10,000 time steps
+        seq_len = X_train.shape[0]
+        
+        for t in range(seq_len):
+            # Input shape: (4, 5) - 4 samples, one from each freq block
+            input_t = X_train[t].to(DEVICE)
+            target_t = y_train[t].unsqueeze(1).to(DEVICE) # Shape (4, 1)
             
             output, (h, c) = model(input_t, (h, c))
             
@@ -50,42 +74,33 @@ def train():
             epoch_loss += loss.item()
             
             if (t + 1) % TBPTT_STEPS == 0:
-                # FIX 2: Normalize loss by steps to keep gradient scale consistent
+                # Normalize loss by steps
                 (loss_buffer / TBPTT_STEPS).backward()
                 
-                # Gentle clipping
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-                
                 optimizer.step()
                 optimizer.zero_grad()
                 
                 h = h.detach()
                 c = c.detach()
                 loss_buffer = 0
-
-            if (t + 1) % 10000 == 0:
-                (h, c) = model.init_hidden(batch_size=1, device=DEVICE)
-                loss_buffer = 0
-                optimizer.zero_grad()
             
-        avg_train_loss = epoch_loss / len(X_train)
+        avg_train_loss = epoch_loss / seq_len
         
-        # Validation
+        # --- Validation ---
         model.eval()
         test_loss = 0.0
-        (h_val, c_val) = model.init_hidden(batch_size=1, device=DEVICE)
+        (h_val, c_val) = model.init_hidden(batch_size=4, device=DEVICE)
         
         with torch.no_grad():
-            for t in range(len(X_test)):
-                input_t = X_test[t].unsqueeze(0).to(DEVICE)
-                target_t = y_test[t].unsqueeze(0).unsqueeze(0).to(DEVICE)
+            for t in range(X_test.shape[0]):
+                input_t = X_test[t].to(DEVICE)
+                target_t = y_test[t].unsqueeze(1).to(DEVICE)
+                
                 output, (h_val, c_val) = model(input_t, (h_val, c_val))
                 test_loss += criterion(output, target_t).item()
-                
-                if (t + 1) % 10000 == 0:
-                    (h_val, c_val) = model.init_hidden(batch_size=1, device=DEVICE)
 
-        avg_test_loss = test_loss / len(X_test)
+        avg_test_loss = test_loss / X_test.shape[0]
         
         print(f"Epoch [{epoch+1}/{EPOCHS}] | Train MSE: {avg_train_loss:.5f} | Test MSE: {avg_test_loss:.5f}")
         
