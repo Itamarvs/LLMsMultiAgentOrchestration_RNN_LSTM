@@ -10,7 +10,7 @@ import os
 HIDDEN_SIZE = 128
 LEARNING_RATE = 0.005 
 TBPTT_STEPS = 200     
-EPOCHS = 50           
+EPOCHS = 100           
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 def load_data_batched(filepath):
